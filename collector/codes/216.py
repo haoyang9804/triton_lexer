@@ -1,0 +1,133 @@
+import os
+import pathlib
+from shutil import copytree
+
+
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+import tritonclient.grpc.model_config_pb2 as model_config
+from google.protobuf import text_format
+
+from merlin.core.protocols import Transformable
+from merlin.dag import ColumnSelector
+from merlin.schema import Schema
+from merlin.systems.dag.ops import compute_dims
+from merlin.systems.dag.runtimes.triton.ops.operator import TritonOperator
+from merlin.systems.dag.runtimes.triton.ops.operator import add_model_param
+from merlin.systems.triton.conversions import (
+    tensor_table_to_triton_request,
+    triton_response_to_tensor_table,
+)
+
+
+class PredictTensorflowTriton(TritonOperator):
+
+    def __init__(self, op):
+        super().__init__(op)
+
+        self.input_schema = op.input_schema
+        self.output_schema = op.output_schema
+        self.path = op.path
+        self.model = op.model
+
+        self._tf_model_name = None
+
+    def __getstate__(self) -> dict:
+
+        return {k: v for k, v in self.__dict__.items() if k != "model"}
+
+    def transform(self, col_selector: ColumnSelector, transformable: Transformable):
+
+        inference_request = tensor_table_to_triton_request(
+            self.tf_model_name,
+            transformable,
+            self.input_schema,
+            self.output_schema,
+        )
+        inference_response = inference_request.exec()
+
+        if inference_response.has_error():
+            raise RuntimeError(inference_response.error().message())
+
+        return triton_response_to_tensor_table(
+            inference_response, type(transformable), self.output_schema
+        )
+
+    def export(
+        self,
+        path: str,
+        input_schema: Schema,
+        output_schema: Schema,
+        params: dict = None,
+        node_id: int = None,
+        version: int = 1,
+    ):
+
+        export_name = self.__class__.__name__.lower()
+        node_name = f"{node_id}_{export_name}" if node_id is not None else export_name
+
+        node_export_path = pathlib.Path(path) / node_name
+        node_export_path.mkdir(exist_ok=True)
+
+        tf_model_path = (
+            pathlib.Path(node_export_path) / str(version) / "model.savedmodel"
+        )
+
+        if self.path:
+            copytree(
+                str(self.path),
+                tf_model_path,
+                dirs_exist_ok=True,
+            )
+        else:
+            self.model.save(tf_model_path, include_optimizer=False)
+
+        self.set_tf_model_name(node_name)
+        backend_model_config = self._export_model_config(node_name, node_export_path)
+        return backend_model_config
+
+    def _export_model_config(self, name, output_path):
+
+        config = model_config.ModelConfig(
+            name=name,
+            backend="tensorflow",
+            platform="tensorflow_savedmodel",
+            instance_group=[
+                model_config.ModelInstanceGroup(
+                    kind=model_config.ModelInstanceGroup.Kind.KIND_AUTO
+                )
+            ],
+        )
+
+        config.parameters["TF_GRAPH_TAG"].string_value = "serve"
+        config.parameters["TF_SIGNATURE_DEF"].string_value = "serving_default"
+
+        for _, col_schema in self.input_schema.column_schemas.items():
+            add_model_param(
+                config.input,
+                model_config.ModelInput,
+                col_schema,
+                compute_dims(col_schema),
+            )
+
+        for _, col_schema in self.output_schema.column_schemas.items():
+            add_model_param(
+                config.output,
+                model_config.ModelOutput,
+                col_schema,
+                compute_dims(col_schema),
+            )
+
+        with open(
+            os.path.join(output_path, "config.pbtxt"), "w", encoding="utf-8"
+        ) as o:
+            text_format.PrintMessage(config, o)
+        return config
+
+    @property
+    def tf_model_name(self):
+        return self._tf_model_name
+
+    def set_tf_model_name(self, tf_model_name: str):
+
+        self._tf_model_name = tf_model_name

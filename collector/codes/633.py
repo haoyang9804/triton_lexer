@@ -1,0 +1,227 @@
+import argparse
+import itertools
+import os
+from typing import Any, Callable, Generator, List, Optional, Tuple
+
+import torch
+import torch._inductor.config as inductor_config
+import triton
+
+try:
+    from hammer.ops.triton.triton_hstu_linear import triton_addmm
+except ModuleNotFoundError:
+    from .hstu import triton_addmm
+
+from tritonbench.operators.gemm.stream_k import streamk_matmul
+from tritonbench.utils.triton_op import (
+    BenchmarkOperator,
+    BenchmarkOperatorMetrics,
+    register_benchmark,
+    register_metric,
+    register_x_val,
+)
+
+from .data_io import parse_args
+
+
+BUILDIN_SHAPES = [
+    (20120, 1536, 512),
+    (34579, 1536, 512),
+    (34839, 1536, 512),
+    (35561, 1536, 512),
+    (35916, 1536, 512),
+    (19735, 1536, 512),
+    (34533, 1536, 512),
+    (35791, 1536, 512),
+    (35844, 1536, 512),
+    (20116, 1536, 512),
+    (33887, 1536, 512),
+    (20203, 1536, 512),
+    (33961, 1536, 512),
+    (19747, 1536, 512),
+    (34181, 1536, 512),
+    (35541, 1536, 512),
+    (36032, 1536, 512),
+    (15168, 1536, 512),
+    (35249, 1536, 512),
+    (33894, 1536, 512),
+    (20067, 1536, 512),
+    (27456, 1536, 512),
+    (19410, 1536, 512),
+    (35884, 1536, 512),
+    (35917, 1536, 512),
+    (19632, 1536, 512),
+    (35656, 1536, 512),
+    (35405, 1536, 512),
+    (35503, 1536, 512),
+    (35504, 1536, 512),
+    (35605, 1536, 512),
+    (34238, 1536, 512),
+    (33660, 1536, 512),
+    (35410, 1536, 512),
+    (20211, 1536, 512),
+    (34308, 1536, 512),
+    (34516, 1536, 512),
+    (20224, 1536, 512),
+    (35678, 1536, 512),
+    (35380, 1536, 512),
+    (35901, 1536, 512),
+    (20068, 1536, 512),
+]
+
+
+LARGE_K_SHAPES = list(itertools.product([13], [2**i for i in range(6, 26)], [2]))
+
+
+class Operator(BenchmarkOperator):
+    DEFAULT_METRICS = ["tflops", "best_config"]
+    DEFAULT_PRECISION = "fp16"
+
+    def __init__(
+        self, tb_args: argparse.Namespace, extra_args: Optional[List[str]] = None
+    ):
+        super().__init__(tb_args, extra_args)
+        addmm_args = parse_args(self.extra_args)
+        if addmm_args.m and addmm_args.n and addmm_args.k:
+            self.shapes = [(addmm_args.m, addmm_args.k, addmm_args.n)]
+        elif addmm_args.large_k_shapes:
+            self.shapes = LARGE_K_SHAPES
+        else:
+            self.shapes = BUILDIN_SHAPES
+        self.col_major = addmm_args.col_major
+
+    @register_benchmark()
+    def triton_addmm(self, a, mat1, mat2) -> Callable:
+        return lambda: triton_addmm(a, mat1, mat2)
+
+    @register_benchmark()
+    def streamk_addmm(self, a, mat1, mat2) -> Callable:
+        return lambda: streamk_matmul(mat1, mat2, bias=a)
+
+    @register_benchmark(baseline=True)
+    def aten_addmm(self, a, mat1, mat2) -> Callable:
+        return lambda: torch.addmm(a, mat1, mat2)
+
+    @register_benchmark()
+    def pt2_triton_matmul(self, a, mat1, mat2) -> Callable:
+        torch._dynamo.reset()
+        with inductor_config.patch(
+            max_autotune=True,
+            max_autotune_gemm_backends="TRITON",
+            autotune_fallback_to_aten=False,
+        ):
+            f = lambda a, mat1, mat2: torch.addmm(a, mat1, mat2)
+            compiled = torch.compile(f, dynamic=False)
+            compiled(a, mat1, mat2)
+        return lambda: compiled(a, mat1, mat2)
+
+    @register_benchmark(enabled=False)
+    def pt2_addmm_maxautotune(self, a, mat1, mat2) -> Callable:
+        torch._dynamo.reset()
+        with inductor_config.patch(
+            max_autotune=True,
+            max_autotune_gemm_backends="ATEN,TRITON",
+            autotune_num_choices_displayed=None,
+        ):
+            f = lambda a, mat1, mat2: torch.addmm(a, mat1, mat2)
+            compiled = torch.compile(f, dynamic=False)
+            compiled(a, mat1, mat2)
+        return lambda: compiled(a, mat1, mat2)
+
+    @register_metric()
+    def gbps(
+        self, fn_name: str, example_inputs: Any, metrics: BenchmarkOperatorMetrics
+    ) -> float:
+        a, mat1, mat2 = example_inputs
+        numel = (
+            a.numel()
+            + mat1.numel()
+            + mat2.numel()
+            + (torch.addmm(a, mat1, mat2).numel())
+        )
+        numel = numel * a.element_size() / 1e9
+        return numel / metrics.latency * 1e3
+
+    @register_metric()
+    def flops(
+        self, fn_name: str, example_inputs: Any, metrics: BenchmarkOperatorMetrics
+    ) -> float:
+        _, mat1, mat2 = example_inputs
+        m, k = mat1.size()
+        k, n = mat2.size()
+        flops = (2 * m * k * n) + (m * n)
+        return flops
+
+    @register_x_val(label="(M, N, K)")
+    def get_x_val(self, example_inputs) -> Tuple[int, int, int]:
+
+        a, mat1, mat2 = example_inputs
+        m, k = mat1.size()
+        k, n = mat2.size()
+        return (m, n, k)
+
+    def get_input_iter(self) -> Generator:
+        for shape_id, shape in enumerate(self.shapes):
+            m, k, n = shape
+            a = torch.randn(
+                (m, n), device=self.device, dtype=self.dtype
+            ).requires_grad_(False)
+            mat1 = torch.randn(
+                (m, k), device=self.device, dtype=self.dtype
+            ).requires_grad_(False)
+            mat2 = torch.randn(
+                (k, n), device=self.device, dtype=self.dtype
+            ).requires_grad_(False)
+            if self.col_major:
+                mat2 = mat2.T.contiguous().T
+            if hasattr(self, "strides"):
+                strides = self.strides[shape_id]
+                assert (
+                    len(strides) == 3
+                ), f"Can only have 3 strides from input, get: {strides}"
+                a = a.as_strided(size=a.size(), stride=strides[0])
+                mat1 = mat1.as_strided(size=mat1.size(), stride=strides[1])
+                mat2 = mat2.as_strided(size=mat2.size(), stride=strides[2])
+            yield a, mat1, mat2
+
+    def _get_accuracy(self, fn: Callable, baseline_fn: Callable) -> bool:
+        output = fn()
+        baseline_output = baseline_fn()
+        accuracy = True
+        try:
+            torch.testing.assert_close(output, baseline_output, atol=1e-5, rtol=0.5)
+        except Exception:
+            accuracy = False
+        finally:
+            return accuracy
+
+    def plot(self):
+        @triton.testing.perf_report(
+            triton.testing.Benchmark(
+                x_names=["density"],
+                x_vals=self.output.x_vals,
+                line_arg="provider",
+                line_vals=[
+                    "aten_addmm",
+                    "triton_addmm",
+                ],
+                line_names=[
+                    "ATen AddMM",
+                    "Triton AddMM",
+                ],
+                styles=[("blue", "-"), ("green", "-")],
+                ylabel="tflops",
+                plot_name="gemm-performance",
+                args={},
+            )
+        )
+        def _plot(density, provider):
+            tflops = self.output.get_y_vals(density, provider, "tflops")
+            return tflops
+
+        save_path = "/tmp/test_addmm"
+
+        if not os.path.exists(save_path):
+            os.mkdir(save_path)
+
+        _plot.run(show_plots=True, print_data=True, save_path="/tmp/test_addmm")

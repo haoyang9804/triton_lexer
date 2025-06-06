@@ -1,0 +1,12 @@
+(ocamllex lexer)
+(menhir (modules parser))
+(library
+ (name triton_lexer)
+ (modules parser lexer converter)
+ (libraries menhirLib))
+
+(env
+ (dev
+  (flags (:standard -warn-error -A))
+ )
+)

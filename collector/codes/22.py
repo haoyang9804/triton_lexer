@@ -1,0 +1,297 @@
+from typing import Optional, Tuple
+
+import torch
+from torch import Tensor
+from torch import nn
+from torch.amp import custom_bwd, custom_fwd
+from triton import cdiv
+
+from .act_kernels import act_func_backward_kernel
+from .batch_norm_kernels import batch_norm_backward_kernel, batch_norm_forward_kernel
+from .types import Context, Device
+
+
+def make_3d_for_bn(input: Tensor) -> Tensor:
+
+    if input.ndim == 2:
+        input = input.unsqueeze(-1)
+
+    elif input.ndim == 4:
+        input = input.flatten(2, -1)
+
+    return input
+
+
+class BatchNormAutoGrad(torch.autograd.Function):
+
+    @staticmethod
+    @custom_fwd(device_type="cuda")
+    def forward(
+        ctx: Context,
+        input: Tensor,
+        training: bool,
+        weight: Optional[Tensor] = None,
+        bias: Optional[Tensor] = None,
+        running_mean: Optional[Tensor] = None,
+        running_var: Optional[Tensor] = None,
+        momentum: float = 0.1,
+        eps: float = 1e-5,
+        track_running_stats: bool = True,
+        pre_act_add: Optional[Tensor] = None,
+        act_func: Optional[str] = None,
+    ) -> Tensor:
+
+        param = None
+        if act_func is not None and "_" in act_func:
+            comps = act_func.split("_")
+            act_func = "_".join(comps[:-1])
+            param = float(comps[-1])
+
+        ctx.param = param
+        ctx.act_func = act_func
+
+        add_pre_act = pre_act_add is not None
+        pre_act_add = (
+            pre_act_add if add_pre_act else torch.empty((1, 1, 1), device="cuda")
+        )
+
+        input_3d = make_3d_for_bn(input)
+        pre_act_add = make_3d_for_bn(pre_act_add)
+        transpose = False
+
+        if input_3d.shape[-1] > 1:
+            input_3d = input_3d.transpose(0, -1)
+            pre_act_add = pre_act_add.transpose(0, -1)
+            transpose = True
+
+        affine = weight is not None and bias is not None
+        requires_grad = (
+            input.requires_grad
+            or pre_act_add.requires_grad
+            or (affine and weight.requires_grad)
+            or (affine and bias.requires_grad)
+        )
+        save_pre_act = requires_grad and (act_func is not None)
+
+        batch_dim, feat_dim, spatial_dim = input_3d.shape
+        output = torch.empty_like(input_3d)
+        pre_act = torch.empty_like(input_3d) if save_pre_act else output
+
+        if requires_grad:
+            mean = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
+            inv_std = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
+
+        else:
+            mean = inv_std = None
+
+        running_mean = input if running_mean is None else running_mean
+        running_var = input if running_var is None else running_var
+
+        grid = lambda _: (feat_dim,)
+        batch_norm_forward_kernel[grid](
+            input_3d,
+            weight,
+            bias,
+            mean,
+            inv_std,
+            pre_act_add,
+            pre_act,
+            output,
+            running_mean,
+            running_var,
+            batch_dim,
+            spatial_dim,
+            *input_3d.stride(),
+            *pre_act_add.stride(),
+            *pre_act.stride(),
+            *output.stride(),
+            momentum,
+            eps,
+            param,
+            affine=affine,
+            save_stats=requires_grad,
+            track_running_stats=track_running_stats,
+            is_train=training,
+            add_pre_act=add_pre_act,
+            act_func=act_func,
+            save_pre_act=save_pre_act
+        )
+
+        if transpose:
+            output = output.transpose(0, -1)
+            if save_pre_act:
+                pre_act = pre_act.transpose(0, -1)
+
+        ctx.affine = affine
+        ctx.act_func = act_func
+        ctx.add_pre_act = add_pre_act
+        if requires_grad:
+            ctx.save_for_backward(
+                input, mean, inv_std, weight, pre_act if save_pre_act else None
+            )
+
+        return output.view_as(input)
+
+    @staticmethod
+    @custom_bwd(device_type="cuda")
+    def backward(
+        ctx: Context,
+        output_grad: Tensor,
+    ) -> Tuple[Optional[Tensor], ...]:
+
+        (input, mean, inv_std, weight, pre_act) = ctx.saved_tensors
+        input_3d = make_3d_for_bn(input)
+
+        if ctx.act_func is None:
+            pre_act_grad = make_3d_for_bn(output_grad)
+
+        else:
+            size = output_grad.numel()
+            pre_act_grad = torch.empty(size, dtype=pre_act.dtype, device=pre_act.device)
+
+            grid = lambda META: (cdiv(size, META["BLOCK_SIZE"]),)
+            act_func_backward_kernel[grid](
+                output_grad.flatten(),
+                pre_act,
+                pre_act_grad,
+                size,
+                None,
+                None,
+                ctx.param,
+                ctx.act_func,
+                False,
+            )
+
+            pre_act_grad = pre_act_grad.view_as(pre_act)
+
+        transpose = False
+        if input_3d.shape[-1] > 1:
+            input_3d = input_3d.transpose(0, -1)
+            pre_act_grad = pre_act_grad.transpose(0, -1)
+            transpose = True
+
+        batch_dim, feat_dim, spatial_dim = input_3d.shape
+        input_grad = torch.empty_like(input_3d)
+
+        if ctx.affine:
+            weight_grad = torch.empty((feat_dim,), device=input.device)
+            bias_grad = torch.empty_like(weight_grad)
+
+        else:
+            weight_grad = bias_grad = None
+
+        grid = lambda _: (feat_dim,)
+        batch_norm_backward_kernel[grid](
+            pre_act_grad,
+            input_3d,
+            mean,
+            inv_std,
+            weight,
+            input_grad,
+            weight_grad,
+            bias_grad,
+            batch_dim,
+            spatial_dim,
+            *pre_act_grad.stride(),
+            *input_3d.stride(),
+            *input_grad.stride(),
+            affine=ctx.affine
+        )
+
+        if transpose:
+            input_grad = input_grad.transpose(0, -1)
+            pre_act_grad = pre_act_grad.transpose(0, -1)
+
+        return (
+            input_grad.view_as(input),
+            None,
+            weight_grad,
+            bias_grad,
+            None,
+            None,
+            None,
+            None,
+            None,
+            pre_act_grad.view_as(input) if ctx.add_pre_act else None,
+            None,
+        )
+
+
+class BatchNorm1d(nn.BatchNorm1d):
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+        act_func: Optional[str] = None,
+        device: Device = "cuda",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__(
+            num_features, eps, momentum, affine, track_running_stats, device, dtype
+        )
+        self.act_func = act_func
+
+    def forward(
+        self,
+        input: Tensor,
+        pre_act_add: Optional[Tensor] = None,
+    ) -> Tensor:
+        self._check_input_dim(input)
+
+        return BatchNormAutoGrad.apply(
+            input,
+            self.training,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.momentum,
+            self.eps,
+            self.track_running_stats,
+            pre_act_add,
+            self.act_func,
+        )
+
+
+class BatchNorm2d(nn.BatchNorm2d):
+
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+        act_func: Optional[str] = None,
+        device: Device = "cuda",
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        super().__init__(
+            num_features, eps, momentum, affine, track_running_stats, device, dtype
+        )
+        self.act_func = act_func
+
+    def forward(
+        self,
+        input: Tensor,
+        pre_act_add: Optional[Tensor] = None,
+    ) -> Tensor:
+        self._check_input_dim(input)
+
+        return BatchNormAutoGrad.apply(
+            input,
+            self.training,
+            self.weight,
+            self.bias,
+            self.running_mean,
+            self.running_var,
+            self.momentum,
+            self.eps,
+            self.track_running_stats,
+            pre_act_add,
+            self.act_func,
+        )
