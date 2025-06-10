@@ -1,69 +1,53 @@
-a = [
-      "def fused_recurrent_linear_attn_fwd_kernel(",
-      "    q,",
-      "    k,",
-      "    v,",
-      "    o,",
-      "    h0,",
-      "    ht,",
-      "    scale,",
-      "    T,",
-      "    B: tl.constexpr,",
-      "    H: tl.constexpr,",
-      "    K: tl.constexpr,",
-      "    V: tl.constexpr,",
-      "    BK: tl.constexpr,",
-      "    BV: tl.constexpr,",
-      "    USE_INITIAL_STATE: tl.constexpr,",
-      "    STORE_FINAL_STATE: tl.constexpr,",
-      "):",
-      "    i_v, i_k, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)",
-      "",
-      "    p_q = q + i_bh * T * K + i_k * BK + tl.arange(0, BK)",
-      "    p_k = k + i_bh * T * K + i_k * BK + tl.arange(0, BK)",
-      "    p_v = v + i_bh * T * V + i_v * BV + tl.arange(0, BV)",
-      "    p_o = o + (i_bh + i_k * B * H) * T * V + i_v * BV + tl.arange(0, BV)",
-      "",
-      "    mask_bk = (i_k * BK + tl.arange(0, BK)) < K",
-      "    mask_bv = (i_v * BV + tl.arange(0, BV)) < V",
-      "    mask_kv = mask_bk[None, :] & mask_bv[:, None]",
-      "",
-      "    b_h = tl.zeros([BV, BK], dtype=tl.float32)",
-      "",
-      "    if USE_INITIAL_STATE:",
-      "        p_h0 = (",
-      "            h0",
-      "            + i_bh * K * V",
-      "            + (i_k * BK + tl.arange(0, BK)[None, :]) * V",
-      "            + (i_v * BV + tl.arange(0, BV)[:, None])",
-      "        )",
-      "        b_h += tl.load(p_h0, mask=mask_kv, other=0).to(tl.float32)",
-      "",
-      "    for _ in range(0, T):",
-      "        b_k = tl.load(p_k, mask=mask_bk, other=0).to(tl.float32)",
-      "        b_v = tl.load(p_v, mask=mask_bv, other=0).to(tl.float32)",
-      "        b_q = tl.load(p_q, mask=mask_bk, other=0).to(tl.float32) * scale",
-      "",
-      "        b_h += b_k[None, :] * b_v[:, None]",
-      "        b_o = b_h * b_q[None, :]",
-      "        b_o = tl.sum(b_o, axis=1)",
-      "        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_bv)",
-      "",
-      "        p_q += K",
-      "        p_k += K",
-      "        p_o += V",
-      "        p_v += V",
-      "",
-      "    if STORE_FINAL_STATE:",
-      "        p_ht = (",
-      "            ht",
-      "            + i_bh * K * V",
-      "            + (i_k * BK + tl.arange(0, BK)[None, :]) * V",
-      "            + (i_v * BV + tl.arange(0, BV)[:, None])",
-      "        )",
-      "        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_kv)"
-]
-
-program = '\n'.join(a)
-print(program)
-
+import triton
+import triton.language as tl
+import numpy as np
+import torch
+def f0 ( 
+     v0 , 
+     v1 , 
+     v2 , 
+     v3 , 
+     v4 , 
+     v5 : tl.constexpr , 
+     v6 : tl.constexpr , 
+     v7 : tl.constexpr , 
+     v8 : tl.constexpr , 
+ ) : 
+ v9 , v10 = tl.program_id ( 0 ) , tl.program_id ( 1 ) 
+ v11 , v12 = v10 // v5 , v10 % v5 
+ if v8 : 
+     v13 , v9 = tl.load ( v3 + v9 * 2 ) . v14 ( tl.int32 ) , tl.load ( 
+     v3 + v9 * 2 + 1 
+     ) . v14 ( tl.int32 ) 
+     v15 , v16 = tl.load ( v2 + v13 ) . v14 ( tl.int32 ) , tl.load ( 
+     v2 + v13 + 1 
+     ) . v14 ( tl.int32 ) 
+     v4 = v16 - v15 
+ else : 
+     v15 , v16 = v11 * v4 , v11 * v4 + v4 
+ v17 = tl.make_block_ptr ( 
+ v0 + ( v15 * v5 + v12 ) * v6 , 
+ ( v4 , v6 ) , 
+ ( v5 * v6 , 1 ) , 
+ ( v9 * v6 , 0 ) , 
+ ( v6 , v6 ) , 
+ ( 1 , 0 ) , 
+ ) 
+ v18 = tl.make_block_ptr ( 
+ v1 + ( v15 * v5 + v12 ) * v6 , 
+ ( v4 , v6 ) , 
+ ( v5 * v6 , 1 ) , 
+ ( v9 * v6 , 0 ) , 
+ ( v6 , v6 ) , 
+ ( 1 , 0 ) , 
+ ) 
+ v19 = tl.load ( v17 , v20 = ( 0 , 1 ) ) 
+ v19 = tl.where ( tl.arange ( 0 , v6 ) [ : , None ] > tl.arange ( 0 , v6 ) [ None , : ] , v19 , 0 ) 
+ for v21 in range ( 1 , v6 ) : 
+     v22 = tl.arange ( 0 , v6 ) == v21 
+     v23 = tl.sum ( tl.where ( v22 [ : , None ] , v19 , 0 ) , 0 ) 
+     v23 = v23 + tl.sum ( v23 [ : , None ] * v19 , 0 ) * ( tl.arange ( 0 , v6 ) < v21 ) 
+     v19 = tl.where ( v22 [ : , None ] , v23 , v19 ) 
+ v19 += tl.arange ( 0 , v6 ) [ : , None ] == tl.arange ( 0 , v6 ) [ None , : ] 
+ tl.store ( v18 , v24 ( v25 ) , v20 = ( 0 , 1 ) ) 
+ 

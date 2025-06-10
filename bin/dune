@@ -1,4 +1,0 @@
-(executable
- (public_name tl)
- (name main)
- (libraries triton_lexer yojson))
