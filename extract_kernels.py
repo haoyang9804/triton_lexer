@@ -9,6 +9,22 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+class KernelCallVisitor(ast.NodeVisitor):
+    """
+    A visitor to detect if a function body calls other specific functions.
+    """
+    def __init__(self, kernel_names: set):
+        self.kernel_names = kernel_names
+        self.calls_other_kernels = False
+
+    def visit_Call(self, node: ast.Call):
+        # Check if the call is to a function name in our list of kernels
+        if isinstance(node.func, ast.Name) and node.func.id in self.kernel_names:
+            self.calls_other_kernels = True
+        # Continue visiting children to find all calls
+        self.generic_visit(node)
+
+
 class TritonKernelExtractor:
     def __init__(self):
         self.kernels = []
@@ -110,42 +126,68 @@ class TritonKernelExtractor:
         return reformatted_lines
 
     def process_file(self, file_path: str) -> List[Dict]:
-        """Process a single Python file and extract Triton kernels"""
+        """Process a single Python file and extract Triton kernels, skipping those that call other kernels."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             
             tree = ast.parse(content)
+
+            # First pass: find all kernel function nodes in the file
+            all_kernel_nodes = {
+                node.name: node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+                and any(
+                    isinstance(d, ast.Call) and self.is_triton_decorator(d)
+                    for d in node.decorator_list
+                )
+            }
+            kernel_names = set(all_kernel_nodes.keys())
+
             file_kernels = []
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef):
-                    # Get only the direct Triton decorators
-                    triton_decorators = [
-                        d for d in node.decorator_list
-                        if isinstance(d, ast.Call) and self.is_triton_decorator(d)
-                    ]
+            # Second pass: filter and extract kernels that do not call other kernels
+            for name, node in all_kernel_nodes.items():
+                other_kernel_names = kernel_names - {name}
+                
+                # If there are other kernels, check for calls to them
+                if other_kernel_names:
+                    visitor = KernelCallVisitor(other_kernel_names)
+                    for body_item in node.body:
+                        visitor.visit(body_item)
                     
-                    if triton_decorators:
+                    if visitor.calls_other_kernels:
+                        logger.info(
+                            f"Skipping kernel '{name}' in {file_path} because it calls another kernel."
+                        )
+                        continue
+
+                # This kernel is valid, extract its info
                         kernel_info = self.extract_kernel_info(node)
                         kernel_info['file'] = file_path
                         
-                        # Get only the direct decorator source code
-                        decorator_sources = []
-                        for decorator in triton_decorators:
-                            decorator_sources.append(self.get_decorator_source(decorator))
+                # Get decorator source code for direct Triton decorators
+                decorator_sources = [
+                    self.get_decorator_source(decorator)
+                    for decorator in node.decorator_list
+                    if isinstance(decorator, ast.Call)
+                    and self.is_triton_decorator(decorator)
+                ]
                         kernel_info['decorator_source'] = decorator_sources
                         
                         # Get function body source code and reformat it
-                        source_lines = content.split('\n')[node.lineno-1:node.end_lineno]
-                        kernel_info['source'] = self.reformat_source(source_lines)
+                source_lines = content.split("\n")[node.lineno - 1 : node.end_lineno]
+                kernel_info["source"] = self.reformat_source(source_lines)
                         
                         file_kernels.append(kernel_info)
             
             return file_kernels
             
+        except SyntaxError as e:
+            logger.warning(f"Skipping file {file_path} due to a syntax error: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Error processing {file_path}: {str(e)}")
+            logger.error(f"An unexpected error occurred while processing {file_path}: {e}")
             return []
     
     def extract_from_directory(self, directory: str) -> List[Dict]:

@@ -123,7 +123,10 @@ class GitHubSearcher:
     
     def is_triton_file(self, content: str) -> bool:
         """Check if file contains Triton-related code"""
-        return content.find("import triton") != -1 or content.find("from triton import") != -1
+        return content.find("@triton.jit") != -1 and (
+            content.find("triton_dist") == -1 and
+            content.find("triton.language.extra.cuda") == -1
+        )
     
     def process_repository(self, repo_info: Dict) -> None:
         """Process a single repository"""
@@ -175,7 +178,7 @@ def main():
     parser = argparse.ArgumentParser(description='GitHub Triton Code Crawler')
     parser.add_argument('--token', type=str, help='GitHub API token')
     parser.add_argument('--output', type=str, default='triton_repos', help='Output directory')
-    parser.add_argument('--max-repos', type=int, default=100, help='Maximum number of repositories to process')
+    parser.add_argument('--max-repos', type=int, default=1000, help='Maximum number of repositories to process')
     parser.add_argument('--query', type=str, default='triton language:python', help='Search query')
     
     args = parser.parse_args()

@@ -48,6 +48,42 @@ def process_directory(directory):
                 file_path = os.path.join(root, file)
                 process_file(file_path)
 
+def test():
+    code = """
+    def min_triton(input_tensor, dim=1):
+        # 确保输入是2D张量
+        assert input_tensor.dim() == 2, "输入张量必须是2D的"
+        # 确保在dim=1上求最小值
+        assert dim == 1, "当前只支持在dim=1上求最小值"
+
+        M, N = input_tensor.shape
+        K = 1  # 因为我们只处理2D张量
+
+        # 分配输出张量
+        min_values = torch.empty((M, K), dtype=torch.float32, device=input_tensor.device)
+        min_indices = torch.empty((M, K), dtype=torch.int64, device=input_tensor.device)
+
+
+        # 计算grid大小
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            K,
+        )
+
+        # 调用kernel
+        min_kernel[grid](
+            input_tensor,
+            min_values,
+            min_indices,
+            M,
+            N,
+            K,
+        )
+
+        return min_values.squeeze(1), min_indices.squeeze(1)
+    """
+    print(remove_comments_and_docstrings(code))
+
 def main():
     parser = argparse.ArgumentParser(description='Remove comments and docstrings from Python files')
     parser.add_argument('--dir', required=True, help='Directory containing Python files')
@@ -65,4 +101,5 @@ def main():
     print("Processing completed")
 
 if __name__ == "__main__":
+    # test()
     main()

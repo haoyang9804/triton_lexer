@@ -1,9 +1,24 @@
 import ply.lex as lex
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from ply.lex import LexToken
 import argparse
 import json
 import sys
+import astwrite
+import tqdm
+import os
+import re
+
+def to_token(name: str) -> str:
+    tok = ''
+    for c in name:
+        if c.isalpha():
+            tok += c.upper()
+        elif c == '.':
+            tok += '_'
+        else:
+            tok += c
+    return tok
 
 # List of token names
 tokens = (
@@ -42,42 +57,14 @@ tokens = (
     'STR', 'TYPE', 'ISINSTANCE', 'TUPLE', 'LIST',
     'DICT', 'SET',
     
-    # Torch specific
-    'TORCH_TENSOR', 'TORCH', 'TORCH_DEVICE', 'TORCH_DTYPE', 'TORCH_LAYOUT',
-    'TORCH_MEMORY_FORMAT', 'TORCH_GRAD', 'TORCH_REQUIRES_GRAD', 'TORCH_BACKWARD',
-    'TORCH_DETACH', 'TORCH_CLONE', 'TORCH_CONTIGUOUS', 'TORCH_CPU', 'TORCH_CUDA',
-    'TORCH_GPU', 'TORCH_CPU_DEVICE', 'TORCH_CUDA_DEVICE', 'TORCH_FLOAT32',
-    'TORCH_FLOAT64', 'TORCH_FLOAT16', 'TORCH_BFLOAT16', 'TORCH_INT8', 'TORCH_INT16',
-    'TORCH_INT32', 'TORCH_INT64', 'TORCH_UINT8', 'TORCH_BOOL', 'TORCH_COMPLEX64',
-    'TORCH_COMPLEX128', 'TORCH_QUINT8', 'TORCH_QINT8', 'TORCH_QINT32',
-    
     # Triton specific
     'DL', 'LIBDEVICE', 'LIBSHMEM_DEVICE',
     'TRITON_HELPERS', 'LANGUAGE', 'TRITON', 'CEIL_DIV',
     'EXP', 'LOG', 'ATOMIC_ADD', 'ATOMIC_CAS', 'ATOMIC_MIN',
-    'ATOMIC_XCHG', 'LD', 'ST', 'TID', 'SYNC_THREADS',
+    'ATOMIC_XCHG', 'LD', 'ST', 'TID',
     'SHFL_DOWN_SYNC_I32', 'SHFL_UP_SYNC_I32', 'SHFL_SYNC_I32',
-    'BALLOT_SYNC', 'FFS',
-    
-    # Triton tl module
-    'TL_ARANGE', 'TL_ATOMIC_ADD', 'TL_ATOMIC_CAS', 'TL_ATOMIC_MIN',
-    'TL_ATOMIC_XCHG', 'TL_ASSUME', 'TL_BFLOAT16', 'TL_BROADCAST_TO',
-    'TL_CAST', 'TL_CDIV', 'TL_CONSTEXPR', 'TL_CUMSUM', 'TL_DEBUG_BARRIER',
-    'TL_DEVICE_ASSERT', 'TL_DOT', 'TL_DOT_SCALED', 'TL_DTYPE', 'TL_EXP',
-    'TL_EXPERIMENTAL_DESCRIPTOR_LOAD', 'TL_EXPERIMENTAL_DESCRIPTOR_STORE',
-    'TL_EXTRA_CUDA_LIBDEVICE_ROUND', 'TL_FDIV', 'TL_FLOAT16', 'TL_FLOAT32',
-    'TL_FLOAT8E4NV', 'TL_FLOAT8E5', 'TL_FLIP', 'TL_FLOOR', 'TL_FMA',
-    'TL_FULL', 'TL_INT16', 'TL_INT2', 'TL_INT32', 'TL_INT64', 'TL_INT8',
-    'TL_INTERLEAVE', 'TL_JOIN', 'TL_LOAD', 'TL_LOG', 'TL_LOG2',
-    'TL_MAKE_BLOCK_PTR', 'TL_MAKE_TENSOR_DESCRIPTOR', 'TL_MATH_EXP2',
-    'TL_MATH_FAST_EXPF', 'TL_MATH_LOG2', 'TL_MATH_MAX', 'TL_MATH_RSQRT',
-    'TL_MAX', 'TL_MAX_CONTIGUOUS', 'TL_MAXIMUM', 'TL_MIN', 'TL_MINIMUM',
-    'TL_MULTIPLE_OF', 'TL_NUM_PROGRAMS', 'TL_PABS', 'TL_PERMUTE',
-    'TL_PI32_T', 'TL_POINTER_TYPE', 'TL_PROGRAM_ID', 'TL_RAND', 'TL_RANGE',
-    'TL_RESHAPE', 'TL_RSQRT', 'TL_SIGMOID', 'TL_SPLIT', 'TL_SQRT',
-    'TL_STANDARD_LOG2', 'TL_STATIC_ASSERT', 'TL_STATIC_PRINT',
-    'TL_STATIC_RANGE', 'TL_STORE', 'TL_SUM', 'TL_SWIZZLE2D', 'TL_TENSOR',
-    'TL_TO', 'TL_TRANS', 'TL_UINT32', 'TL_VIEW', 'TL_WHERE', 'TL_ZEROS',
+    'BALLOT_SYNC', 'FFS', 'SYNCTHREADS', 'FP_DOWNCAST_ROUNDING',
+    'FP_UPCAST_ROUNDING', 'ELEMENT_TY', 'ELEMENT_TX',
     
     # Special string literals
     'CUDA_STR', 'CPU_STR', 'GPU_STR', 'MPS_STR', 'XPU_STR', 'IPU_STR', 'HPU_STR', 'MTIA_STR',
@@ -145,6 +132,21 @@ def token_to_str(token: str) -> str:
     }
     return dic.get(token, token)
 
+class TLFuncLexer:
+    def __init__(self):
+        self.tl_pattern = re.compile(r'tl(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*')
+        self.tl_funcs = set()
+        self.torch_pattern = re.compile(r'torch(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*')
+        self.torch_funcs = set()
+    
+    def tokenize(self, code: str) -> None:
+        matches = self.tl_pattern.findall(code)
+        for match in matches:
+            self.tl_funcs.add(match)
+        matches = self.torch_pattern.findall(code)
+        for match in matches:
+            self.torch_funcs.add(match)
+    
 class TritonLexer:
     # List of token names
     tokens = tokens
@@ -200,6 +202,7 @@ class TritonLexer:
         # Python keywords
         'def': 'DEF',
         'if': 'IF',
+        'while': 'WHILE',
         'else': 'ELSE',
         'elif': 'ELIF',
         'for': 'FOR',
@@ -217,6 +220,18 @@ class TritonLexer:
         'continue': 'CONTINUE',
         'pass': 'PASS',
         'yield': 'YIELD',
+        
+        # End
+        'enddef': 'ENDDEF',
+        'endif': 'ENDIF',
+        'endelse': 'ENDELSE',
+        'endelif': 'ENDELIF',
+        'endfor': 'ENDFOR',
+        'endwhile': 'ENDWHILE',
+        'endwith': 'ENDWITH',
+        'endtry': 'ENDTRY',
+        'endexcept': 'ENDEXCEPT',
+        'endfinally': 'ENDFINALLY',
        
         # Built-in functions
         'min': 'MIN',
@@ -292,94 +307,17 @@ class TritonLexer:
         'ld': 'LD',
         'st': 'ST',
         'tid': 'TID',
-        'sync_threads': 'SYNC_THREADS',
         'shfl_down_sync_i32': 'SHFL_DOWN_SYNC_I32',
         'shfl_up_sync_i32': 'SHFL_UP_SYNC_I32',
         'shfl_sync_i32': 'SHFL_SYNC_I32',
         'ballot_sync': 'BALLOT_SYNC',
         'ffs': 'FFS',
-        
-        # Triton tl module
-        'tl.arange': 'TL_ARANGE',
-        'tl.atomic_add': 'TL_ATOMIC_ADD',
-        'tl.atomic_cas': 'TL_ATOMIC_CAS',
-        'tl.atomic_min': 'TL_ATOMIC_MIN',
-        'tl.atomic_xchg': 'TL_ATOMIC_XCHG',
-        'tl.assume': 'TL_ASSUME',
-        'tl.bfloat16': 'TL_BFLOAT16',
-        'tl.broadcast_to': 'TL_BROADCAST_TO',
-        'tl.cast': 'TL_CAST',
-        'tl.cdiv': 'TL_CDIV',
-        'tl.constexpr': 'TL_CONSTEXPR',
-        'tl.cumsum': 'TL_CUMSUM',
-        'tl.debug_barrier': 'TL_DEBUG_BARRIER',
-        'tl.device_assert': 'TL_DEVICE_ASSERT',
-        'tl.dot': 'TL_DOT',
-        'tl.dot_scaled': 'TL_DOT_SCALED',
-        'tl.dtype': 'TL_DTYPE',
-        'tl.exp': 'TL_EXP',
-        'tl.experimental_descriptor_load': 'TL_EXPERIMENTAL_DESCRIPTOR_LOAD',
-        'tl.experimental_descriptor_store': 'TL_EXPERIMENTAL_DESCRIPTOR_STORE',
-        'tl.extra_cuda_libdevice_round': 'TL_EXTRA_CUDA_LIBDEVICE_ROUND',
-        'tl.fdiv': 'TL_FDIV',
-        'tl.float16': 'TL_FLOAT16',
-        'tl.float32': 'TL_FLOAT32',
-        'tl.float8e4nv': 'TL_FLOAT8E4NV',
-        'tl.float8e5': 'TL_FLOAT8E5',
-        'tl.flip': 'TL_FLIP',
-        'tl.floor': 'TL_FLOOR',
-        'tl.fma': 'TL_FMA',
-        'tl.full': 'TL_FULL',
-        'tl.int16': 'TL_INT16',
-        'tl.int2': 'TL_INT2',
-        'tl.int32': 'TL_INT32',
-        'tl.int64': 'TL_INT64',
-        'tl.int8': 'TL_INT8',
-        'tl.interleave': 'TL_INTERLEAVE',
-        'tl.join': 'TL_JOIN',
-        'tl.load': 'TL_LOAD',
-        'tl.log': 'TL_LOG',
-        'tl.log2': 'TL_LOG2',
-        'tl.make_block_ptr': 'TL_MAKE_BLOCK_PTR',
-        'tl.make_tensor_descriptor': 'TL_MAKE_TENSOR_DESCRIPTOR',
-        'tl.math.exp2': 'TL_MATH_EXP2',
-        'tl.math.fast_expf': 'TL_MATH_FAST_EXPF',
-        'tl.math.log2': 'TL_MATH_LOG2',
-        'tl.math.max': 'TL_MATH_MAX',
-        'tl.math.rsqrt': 'TL_MATH_RSQRT',
-        'tl.max': 'TL_MAX',
-        'tl.max_contiguous': 'TL_MAX_CONTIGUOUS',
-        'tl.maximum': 'TL_MAXIMUM',
-        'tl.min': 'TL_MIN',
-        'tl.minimum': 'TL_MINIMUM',
-        'tl.multiple_of': 'TL_MULTIPLE_OF',
-        'tl.num_programs': 'TL_NUM_PROGRAMS',
-        'tl.pabs': 'TL_PABS',
-        'tl.permute': 'TL_PERMUTE',
-        'tl.pi32_t': 'TL_PI32_T',
-        'tl.pointer_type': 'TL_POINTER_TYPE',
-        'tl.program_id': 'TL_PROGRAM_ID',
-        'tl.rand': 'TL_RAND',
-        'tl.range': 'TL_RANGE',
-        'tl.reshape': 'TL_RESHAPE',
-        'tl.rsqrt': 'TL_RSQRT',
-        'tl.sigmoid': 'TL_SIGMOID',
-        'tl.split': 'TL_SPLIT',
-        'tl.sqrt': 'TL_SQRT',
-        'tl.standard_log2': 'TL_STANDARD_LOG2',
-        'tl.static_assert': 'TL_STATIC_ASSERT',
-        'tl.static_print': 'TL_STATIC_PRINT',
-        'tl.static_range': 'TL_STATIC_RANGE',
-        'tl.store': 'TL_STORE',
-        'tl.sum': 'TL_SUM',
-        'tl.swizzle2d': 'TL_SWIZZLE2D',
-        'tl.tensor': 'TL_TENSOR',
-        'tl.to': 'TL_TO',
-        'tl.trans': 'TL_TRANS',
-        'tl.uint32': 'TL_UINT32',
-        'tl.view': 'TL_VIEW',
-        'tl.where': 'TL_WHERE',
-        'tl.zeros': 'TL_ZEROS',
+        '.to': 'DOTTO',
+        '__syncthreads': 'SYNCTHREADS',
+        'fp_downcast_rounding': 'FP_DOWNCAST_ROUNDING',
+        'fp_upcast_rounding': 'FP_UPCAST_ROUNDING',
+        'element_ty': 'ELEMENT_TY',
+        'element_tx': 'ELEMENT_TX',
         
         # Special argument keywords
         'device': 'DEVICE',
@@ -402,6 +340,8 @@ class TritonLexer:
         'grad_fn': 'GRAD_FN',
         'grad': 'GRAD',
     }
+    
+    # keywords = {k: v for k, v in zip(triton_keywords, tokens)}
     
     # Special string literals that should be treated as tokens
     special_strings = {
@@ -436,23 +376,36 @@ class TritonLexer:
         content = t.value[1:-1]  # Remove quotes
         if content in self.special_strings:
             t.type = self.special_strings[content]
-            t.value = content
+            t.value = t.value  # 保留原始字符串（包括引号）
         else:
-            t.value = content  # Remove quotes
+            t.value = t.value  # 保留原始字符串（包括引号）
+        # 只有当内容不为空时才返回 token
+        if content:
+            return t
+        return None  # 忽略空字符串
+    
+    def t_TL_FUNC(self, t):
+        r'tl(\.[a-zA-Z_0-9]*)*'
+        t.type = self.keywords.get(t.value, 'ERROR')
+        return t
+    
+    def t_TORCH_FUNC(self, t):
+        r'torch(\.[a-zA-Z_0-9]*)*'
+        t.type = self.keywords.get(t.value, 'ERROR')
         return t
     
     def t_ID(self, t):
-        r'[a-zA-Z_][a-zA-Z_0-9]*(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*'
+        r'[a-zA-Z_][a-zA-Z_0-9]*'
         t.type = self.keywords.get(t.value, 'ID')
         return t
     
     def t_FLOAT(self, t):
-        r'\d*\.\d+'
+        r'(\d*\.\d+([eE][-+]?\d+)?|\d+[eE][-+]?\d+)'
         t.value = float(t.value)
         return t
     
     def t_INT(self, t):
-        r'\d+'
+        r'\d'
         t.value = int(t.value)
         return t
     
@@ -491,7 +444,6 @@ class TritonTokenEncoderDecoder:
         self.varid = 0
         self.fid = 0
         self.tokens = []
-        self.val2tokenid = {}
     
     def print_mapping(self):
         for k, v in self.mapping.items():
@@ -504,71 +456,40 @@ class TritonTokenEncoderDecoder:
         tok.lineno = lineno
         tok.lexpos = lexpos
         return tok
+
     
     def tokenize(self, string: str) -> int:
-        class Block:
-            def __init__(self, name: str, lexpos: int):
-                self.name = name
-                self.lexpos = lexpos
-                self.next_block = None
-                self.prev_block = None
-            def set_new_block(self, name: str, lexpos: int):
-                new_block = Block(name, lexpos)
-                new_block.prev_block = self
-                self.next_block = new_block
-                return new_block
-            def __str__(self):
-                return f'{self.name} {self.lexpos}'
-
+        self.tokens = []
+        # For each block, add the end mark.
+        # e.g., add endwhile for a while loop
+        string = astwrite.add_end_marks(string)
         strs = string.split('\n')
-        block = Block('header', 0)
         for linenum, s in enumerate(strs):
-            lexpos = -1
             last_token = None
             self.lexer.input(s)
-            lexpos_decrease = 0
-            first_token = True
             while True:
                 tok = self.lexer.token()
                 if not tok:
                     break
-                tok.lexpos -= lexpos_decrease
                 tok.lineno = linenum + 1
-                if first_token:
-                    first_token = False
-                    if block.name != 'header' and tok.lexpos == block.lexpos:
-                        self.tokens.append(self._new_token(f'END{block.name}', '', -1, -1))
-                        block = block.prev_block
-                    if is_block_start(tok.type):
-                        block = block.set_new_block(tok.type, tok.lexpos)
                 if tok.type == 'ID':
                     if self.oldName2NewName.get(tok.value) is not None:
-                        lexpos_decrease += len(tok.value) - len(self.oldName2NewName[tok.value])
                         tok.value = self.oldName2NewName[tok.value]
                     else:
                         if last_token and last_token.value == 'def':
                             fname = f'f{self.fid}'
                             self.oldName2NewName[tok.value] = fname
-                            lexpos_decrease += len(tok.value) - len(fname)
                             tok.value = fname
                             self.fid += 1
                         else:
                             vname = f'v{self.varid}'
-                            lexpos_decrease += len(tok.value) - len(vname)
                             self.oldName2NewName[tok.value] = vname
                             tok.value = vname
                             self.varid += 1
                 self.tokens.append(tok)
-                lexpos = tok.lexpos
                 last_token = tok
-            if lexpos == -1: lexpos = 0
-            end_token = self._new_token('ENTER', '<enter>', linenum + 1, lexpos + len(str(last_token.value)) if last_token is not None else 0)
+            end_token = self._new_token('ENTER', '<enter>', -1, -1)
             self.tokens.append(end_token)
-        while block.name != 'header':
-            self.tokens.append(self._new_token(f'END{block.name}', '', -1, -1))
-            block = block.prev_block
-        for i, token in enumerate(self.tokens):
-            self.val2tokenid[token.value] = i
         return self.tokens
 
     def encode(self) -> List[int]:
@@ -607,15 +528,32 @@ class TritonTokenEncoderDecoder:
         program = ''
         indent = 0
         first_token_of_the_line = True
-        for v in encoded:
+        i = 0
+        while i < len(encoded):
+            v = encoded[i]
             if v == -1:
+                i += 1
                 continue
             if is_block_end(reverse_mapping[v]):
                 indent -= 1
+                i += 1
                 continue
             if first_token_of_the_line:
-                program += ' ' * indent * 4
+                program += ' ' * (indent * 4)
+                if is_block_start(reverse_mapping[v]):
+                    indent += 1
                 first_token_of_the_line = False
+            
+            # 检查下一个token是否是DOT
+            next_is_dot = i + 1 < len(encoded) and encoded[i+1] in reverse_mapping and reverse_mapping.get(encoded[i+1]) == 'DOT'
+            # 检查当前token是否是DOT
+            current_is_dot = reverse_mapping[v] == 'DOT'
+            # 检查前一个token是否是DOT
+            prev_is_dot = i > 0 and encoded[i-1] in reverse_mapping and reverse_mapping[encoded[i-1]] == 'DOT'
+            # 检查当前token是否是INT
+            current_is_int = isinstance(reverse_mapping[v], int)
+            # 检查下一个token是否是INT
+            next_is_int = i + 1 < len(encoded) and encoded[i+1] in reverse_mapping and isinstance(reverse_mapping.get(encoded[i+1]), int)
             if reverse_mapping[v] == 'ENTER':
                 program += '\n'
                 first_token_of_the_line = True
@@ -624,57 +562,122 @@ class TritonTokenEncoderDecoder:
                     program += str(token_to_str(token2value[reverse_mapping[v]]))
                 else:
                     program += str(token_to_str(reverse_mapping[v]))
-            program += ' '
-            if is_block_start(reverse_mapping[v]):
-                indent += 1
+                
+                # 只在以下情况添加空格：
+                # 1. 当前token不是DOT
+                # 2. 下一个token不是DOT
+                # 3. 当前token不是ID
+                # 4. 下一个token不是ID
+                # 5. 当前token和下一个token不都是INT
+                if not current_is_dot and not next_is_dot and \
+                   not (reverse_mapping[v] == 'ID' and next_is_dot) and \
+                   not (prev_is_dot and reverse_mapping[v] == 'ID') and \
+                   not (current_is_int and next_is_int):
+                    program += ' '
+            i += 1
         return program
-# class TritonTokenDecoder:
-#     def __init__(self, encoder: TritonTokenEncoder):
-#         self.mapping = encoder.mapping
-#         self.tokens = encoder.tokens
-    
-#     def decode(self) -> str:
-#         program = ''
-#         prev_lineno = -1
-#         prev_lexpos = -1
-#         prev_token = None
-#         for token in self.tokens:
-#             if token.type == 'ENTER':
-#                 program += '\n'
-#             else:
-#                 if token.lineno == prev_lineno:
-#                     assert prev_token is not None, 'prev_token is None'
-#                     if prev_token.type == 'STRING' or '_STR' in prev_token.type:
-#                         self_length = len(str(prev_token.value)) + 2
-#                     else:
-#                         self_length = len(str(prev_token.value))
-#                     program += ' ' * (token.lexpos - (prev_lexpos + self_length))
-#                 else:
-#                     program += ' ' * token.lexpos
-#                 if token.type == 'STRING' or '_STR' in token.type: program += '"'
-#                 program += str(token.value)
-#                 if token.type == 'STRING' or '_STR' in token.type: program += '"'
-#                 prev_token = token
-#                 prev_lineno = token.lineno
-#                 prev_lexpos = token.lexpos
-        # return program
+
+def add_tl_torch_funcs(string: str):
+    tl_lexer = TLFuncLexer()
+    tl_lexer.tokenize(string)
+    global tokens
+    tokens = tuple(list(TritonLexer.tokens) + [to_token(func) for func in tl_lexer.tl_funcs] + [to_token(func) for func in tl_lexer.torch_funcs])
+    tokens = tuple(list(set(tokens)))
+    TritonLexer.tokens = tokens
+    for tlf in tl_lexer.tl_funcs:
+        TritonLexer.keywords[tlf] = to_token(tlf)
+    for tlf in tl_lexer.torch_funcs:
+        TritonLexer.keywords[tlf] = to_token(tlf)
 
 # Test function
 def test1():
-    data = '''
-    def f():
-        if x > 0.3:
-            return x + y
-        else:
-            return 0
-    '''
-    # data = 'def batch_norm_forward_kernel(input_pointer, weight_pointer, bias_pointer, mean_pointer, inv_std_pointer, pre_act_add_pointer, pre_act_pointer, output_pointer, running_mean_pointer, running_var_pointer, batch_dim, spatial_dim, input_batch_stride, input_feat_stride, input_spatial_stride, pre_act_add_batch_stride, pre_act_add_feat_stride, pre_act_add_spatial_stride, pre_act_batch_stride, pre_act_feat_stride, pre_act_spatial_stride, output_batch_stride, output_feat_stride, output_spatial_stride, momentum, eps, param, affine: tl.constexpr, save_stats: tl.constexpr, track_running_stats: tl.constexpr, is_train: tl.constexpr, add_pre_act: tl.constexpr, act_func: tl.constexpr, save_pre_act: tl.constexpr, BLOCK_SIZE_BATCH: tl.constexpr, BLOCK_SIZE_SPATIAL: tl.constexpr):'
-#     data = """
-# def kernel(x, y):
-#     tl.arange("x", "cuda")
-#     """
+    data = '-1000'
     encoder = TritonTokenEncoderDecoder()
     encoder.print_mapping()
+    print(encoder.tokenize(data))
+    print(encoder.encode())
+    print(encoder.decode(encoder.encode()))
+
+def test2():
+    data = '''def causal_conv1d_fwd_kernel(
+    x: torch.GUGUGU,
+    y,
+    weight,
+    bias,
+    residual,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    B: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+    NB: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n), tl.load(cu_seqlens + i_n + 1)
+        T = eos - bos
+    else:
+        i_n = i_b
+        bos, eos = i_b * T, i_b * T + T
+
+    o_d = i_d * BD + tl.arange(0, BD)
+    o_w = tl.arange(0, W)
+    m_d = o_d < D
+
+    if HAS_WEIGHT:
+
+        b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None], other=0).to(
+            tl.float32
+        )
+
+    b_y = tl.zeros((BT, BD), dtype=tl.float32)
+    for i_w in tl.static_range(-W + 1, 1):
+        p_yi = tl.make_block_ptr(
+            x + bos * D, (T, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0)
+        )
+
+        b_yi = tl.load(p_yi, boundary_check=(0, 1))
+        if HAS_WEIGHT:
+            b_yi *= tl.sum(b_w * (o_w == (i_w + W - 1)), 1)
+        b_y += b_yi
+    if HAS_BIAS:
+        b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
+
+    if ACTIVATION == "swish" or ACTIVATION == "silu":
+        b_y = b_y * tl.sigmoid(b_y)
+
+    if HAS_RESIDUAL:
+        p_residual = tl.make_block_ptr(
+            residual + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0)
+        )
+        b_residual = tl.load(p_residual, boundary_check=(0, 1))
+        b_y += b_residual
+
+    p_y = tl.make_block_ptr(
+        y + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0)
+    )
+    tl.store(
+        p_y,
+        tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding="rtne"),
+        boundary_check=(0, 1),
+    )
+'''
+
+    add_tl_torch_funcs(data)
+    print(TritonLexer.tokens)
+    encoder = TritonTokenEncoderDecoder()
     print(encoder.tokenize(data))
     print(encoder.encode())
     print(encoder.decode(encoder.encode()))
@@ -700,7 +703,6 @@ def process_json_file(filename: str) -> List[Dict[str, Any]]:
             for datum in data:
                 source = '\n'.join(datum['source'])
                 results.append(source)
-                break
             return results
     except FileNotFoundError:
         print(f"Error: File '{filename}' not found")
@@ -711,19 +713,31 @@ def process_json_file(filename: str) -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"Error processing JSON file: {e}")
         sys.exit(1)
-
-def verify(program: str) -> bool:
+        
+def verify(program: str, original_program: str, results: List[Dict[str, Any]], mapping: Dict[str, str], output: str) -> bool:
     with open('test.py', 'w') as f:
-        f.write('import triton\nimport triton.language as tl\nimport numpy as np\nimport torch\n' + program)
+        # triton_imports = '\n'.join(extract_imports_from_code(original_program)['triton'])
+        triton_imports = '''
+import triton
+import triton.language as tl
+from triton import *
+from triton.language import *
+import numpy as np
+import torch
+        '''
+        f.write(f'\'\'\'{original_program}\n\'\'\'\n{triton_imports}\n' + program)
     import subprocess
     result = subprocess.run(['python', 'test.py'], capture_output=True, text=True)
     if result.returncode != 0 or result.stderr != '':
+        if original_program != '':
+            print(original_program)
         print(result.stderr)
         print(f'return code: {result.returncode}')
         print(program)
+        with open(output, 'w') as f:
+            json.dump({'kernels': results, 'mapping': mapping}, f)
         import sys 
         sys.exit(1)
-        
 
 def main():
     parser = argparse.ArgumentParser(
@@ -755,19 +769,15 @@ Examples:
     
     # 添加输出选项
     parser.add_argument('-o', '--output',
+                        required=True,
                        help='Output file path (default: print to stdout)')
-    parser.add_argument('--pretty',
-                       action='store_true',
-                       help='Pretty print the output')
     
     args = parser.parse_args()
     
-    # 创建编码器
-    encoder = TritonTokenEncoderDecoder()
     
-    # 处理输入
     if args.string:
-        # 处理代码字符串
+        add_tl_torch_funcs(args.string)
+        encoder = TritonTokenEncoderDecoder()
         encoder.tokenize(args.string)
         encoded = encoder.encode()
         result = {
@@ -775,8 +785,9 @@ Examples:
             'encoded': encoded
         }
     elif args.file:
-        # 处理代码文件
         code = read_file(args.file)
+        add_tl_torch_funcs(code)
+        encoder = TritonTokenEncoderDecoder()
         encoder.tokenize(code)
         encoded = encoder.encode()
         result = {
@@ -787,34 +798,38 @@ Examples:
         # 处理JSON文件
         codes = process_json_file(args.json)
         results = []
-        for code in codes:
+        start_id = -1
+        if os.path.exists('endecoder.log') and os.path.getsize('endecoder.log') > 0:
+            with open('endecoder.log', 'r') as f:
+                start_id = int(f.read())
+        start_id += 1
+        if os.path.exists('encoded_kernels.json'):
+                with open('encoded_kernels.json', 'r') as f:
+                    original_results = json.load(f)
+                    results = original_results['kernels']
+        for i, code in enumerate(tqdm.tqdm(codes[start_id:])):
+            add_tl_torch_funcs(code)
+            encoder = TritonTokenEncoderDecoder()
+            if os.path.exists('encoded_kernels.json'):
+                with open('encoded_kernels.json', 'r') as f:
+                    original_results = json.load(f)
+                    encoder.mapping.update(original_results['mapping'])
+            with open('endecoder.log', 'w') as f:
+                f.write(f'{start_id + i}')
             encoder.tokenize(code)
             encoded = encoder.encode()
-            print(code)
-            verify(encoder.decode(encoded))
-            print('====================')
+            verify(encoder.decode(encoded), code, results, encoder.mapping, args.output)
             results.append({
                 'code': code,
                 'encoded': encoded
             })
-        result = {'kernels': results}
+        result = {'kernels': results, 'mapping': encoder.mapping}
     
-    # 处理输出
     if args.output:
-        # 写入文件
         with open(args.output, 'w') as f:
-            if args.pretty:
-                json.dump(result, f, indent=2)
-            else:
-                json.dump(result, f)
-    else:
-        # 打印到标准输出
-        if args.pretty:
-            print(json.dumps(result, indent=2))
-        else:
-            print(json.dumps(result))
+            json.dump(result, f)
     
 
 if __name__ == '__main__':
     main()
-    
+    # test1()
