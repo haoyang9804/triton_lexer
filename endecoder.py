@@ -599,80 +599,102 @@ def test1():
     print(encoder.decode(encoder.encode()))
 
 def test2():
-    data = '''def causal_conv1d_fwd_kernel(
-    x: torch.GUGUGU,
-    y,
-    weight,
-    bias,
-    residual,
-    cu_seqlens,
-    chunk_indices,
+    data = '''
+def parallel_nsa_compression_bwd_kernel_dq(
+    q,
+    k,
+    v,
+    lse,
+    delta,
+    do,
+    dq,
+    scale,
+    offsets,
+    token_indices,
+    chunk_offsets,
     T,
     B: tl.constexpr,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    NB: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    G: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BC: tl.constexpr,
+    BS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    USE_OFFSETS: tl.constexpr,
 ):
-    i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_t, i_v, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_b, i_h = i_bh // H, i_bh % H
 
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
+    if USE_OFFSETS:
+        i_n, i_t = tl.load(token_indices + i_t * 2).to(tl.int32), tl.load(
+            token_indices + i_t * 2 + 1
         ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n), tl.load(cu_seqlens + i_n + 1)
+        bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(
+            tl.int32
+        )
         T = eos - bos
+        boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
-        i_n = i_b
         bos, eos = i_b * T, i_b * T + T
+        boc = i_b * tl.cdiv(T, BS)
 
-    o_d = i_d * BD + tl.arange(0, BD)
-    o_w = tl.arange(0, W)
-    m_d = o_d < D
+    q += (bos + i_t) * HQ * K
+    do += (bos + i_t) * HQ * V
+    lse += (bos + i_t) * HQ
+    delta += (bos + i_t) * HQ
+    dq += (i_v * B * T + bos + i_t) * HQ * K
 
-    if HAS_WEIGHT:
+    p_q = tl.make_block_ptr(q, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
+    p_dq = tl.make_block_ptr(dq, (HQ, K), (K, 1), (i_h * G, 0), (G, BK), (1, 0))
 
-        b_w = tl.load(weight + o_d[:, None] * W + o_w, mask=m_d[:, None], other=0).to(
-            tl.float32
+    b_q = tl.load(p_q, boundary_check=(0, 1))
+    b_q = (b_q * scale).to(b_q.dtype)
+
+    p_do = tl.make_block_ptr(do, (HQ, V), (V, 1), (i_h * G, i_v * BV), (G, BV), (1, 0))
+    p_lse = lse + i_h * G + tl.arange(0, G)
+    p_delta = delta + i_h * G + tl.arange(0, G)
+
+    TC = tl.cdiv(T, BS)
+
+    NC = (i_t + 1) // BS
+
+    b_do = tl.load(p_do, boundary_check=(0, 1))
+
+    b_lse = tl.load(p_lse)
+    b_delta = tl.load(p_delta)
+
+    b_dq = tl.zeros([G, BK], dtype=tl.float32)
+    for i_c in range(0, NC, BC):
+        o_c = i_c + tl.arange(0, BC)
+        p_k = tl.make_block_ptr(
+            k + (boc * H + i_h) * K, (K, TC), (1, H * K), (0, i_c), (BK, BC), (0, 1)
+        )
+        p_v = tl.make_block_ptr(
+            v + (boc * H + i_h) * V,
+            (V, TC),
+            (1, H * V),
+            (i_v * BV, i_c),
+            (BV, BC),
+            (0, 1),
         )
 
-    b_y = tl.zeros((BT, BD), dtype=tl.float32)
-    for i_w in tl.static_range(-W + 1, 1):
-        p_yi = tl.make_block_ptr(
-            x + bos * D, (T, D), (D, 1), (i_t * BT + i_w, i_d * BD), (BT, BD), (1, 0)
-        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
 
-        b_yi = tl.load(p_yi, boundary_check=(0, 1))
-        if HAS_WEIGHT:
-            b_yi *= tl.sum(b_w * (o_w == (i_w + W - 1)), 1)
-        b_y += b_yi
-    if HAS_BIAS:
-        b_y += tl.load(bias + o_d, mask=m_d).to(tl.float32)
+        b_v = tl.load(p_v, boundary_check=(0, 1))
 
-    if ACTIVATION == "swish" or ACTIVATION == "silu":
-        b_y = b_y * tl.sigmoid(b_y)
+        b_s = tl.dot(b_q, b_k)
+        b_p = tl.exp(b_s - b_lse[:, None])
+        b_p = tl.where((o_c < NC)[None, :], b_p, 0)
 
-    if HAS_RESIDUAL:
-        p_residual = tl.make_block_ptr(
-            residual + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0)
-        )
-        b_residual = tl.load(p_residual, boundary_check=(0, 1))
-        b_y += b_residual
+        b_dp = tl.dot(b_do, b_v)
+        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
 
-    p_y = tl.make_block_ptr(
-        y + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0)
-    )
-    tl.store(
-        p_y,
-        tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding="rtne"),
-        boundary_check=(0, 1),
-    )
+        b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
+    b_dq *= scale
+    tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), boundary_check=(0, 1))
 '''
 
     add_tl_torch_funcs(data)
@@ -831,5 +853,5 @@ Examples:
     
 
 if __name__ == '__main__':
-    main()
-    # test1()
+    # main()
+    test2()

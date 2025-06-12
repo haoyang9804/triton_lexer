@@ -25,15 +25,15 @@ if __name__ == "__main__":
     if not token:
         logger.warning("No GitHub token provided. Rate limits will be restricted.")
     
-    # searcher = GitHubSearcher(token, 'triton_repos')
-    # searcher.crawl('triton language:python', 1000)
-    # logger.info("Crawling completed")
+    searcher = GitHubSearcher(token, 'triton_repos')
+    searcher.crawl('triton language:python', 1000)
+    logger.info("Crawling completed")
     
-    # rename_files('triton_repos', 1)
-    # logger.info("File renaming completed")
+    rename_files('triton_repos', 1)
+    logger.info("File renaming completed")
     
-    # process_directory('triton_repos')
-    # logger.info("Comments removal completed")
+    process_directory('triton_repos')
+    logger.info("Comments removal completed")
     
     extractor = TritonKernelExtractor()
     kernels = extractor.extract_from_directory('triton_repos')
@@ -67,7 +67,6 @@ if __name__ == "__main__":
             'code': code,
             'encoded': encoded
         })
-        break
     if encoder:
         result = {'kernels': results, 'mapping': encoder.mapping}
         
