@@ -163,8 +163,8 @@ class TritonKernelExtractor:
                         continue
 
                 # This kernel is valid, extract its info
-                        kernel_info = self.extract_kernel_info(node)
-                        kernel_info['file'] = file_path
+                kernel_info = self.extract_kernel_info(node)
+                kernel_info['file'] = file_path
                         
                 # Get decorator source code for direct Triton decorators
                 decorator_sources = [
@@ -173,13 +173,13 @@ class TritonKernelExtractor:
                     if isinstance(decorator, ast.Call)
                     and self.is_triton_decorator(decorator)
                 ]
-                        kernel_info['decorator_source'] = decorator_sources
+                kernel_info['decorator_source'] = decorator_sources
                         
                         # Get function body source code and reformat it
                 source_lines = content.split("\n")[node.lineno - 1 : node.end_lineno]
                 kernel_info["source"] = self.reformat_source(source_lines)
                         
-                        file_kernels.append(kernel_info)
+                file_kernels.append(kernel_info)
             
             return file_kernels
             

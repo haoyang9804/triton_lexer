@@ -804,9 +804,9 @@ Examples:
                 start_id = int(f.read())
         start_id += 1
         if os.path.exists('encoded_kernels.json'):
-                with open('encoded_kernels.json', 'r') as f:
-                    original_results = json.load(f)
-                    results = original_results['kernels']
+            with open('encoded_kernels.json', 'r') as f:
+                original_results = json.load(f)
+                results = original_results['kernels']
         for i, code in enumerate(tqdm.tqdm(codes[start_id:])):
             add_tl_torch_funcs(code)
             encoder = TritonTokenEncoderDecoder()
