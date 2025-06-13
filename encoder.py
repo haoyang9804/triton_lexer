@@ -425,7 +425,7 @@ class TritonLexer:
     def __init__(self):
         self.lexer = lex.lex(module=self)
 
-class TritonTokenEncoderDecoder:
+class TritonTokenEncoder:
     def __init__(self):
         self.mapping = {}
         for i, v in enumerate(tokens):
@@ -592,7 +592,7 @@ def add_tl_torch_funcs(string: str):
 # Test function
 def test1():
     data = '-1000'
-    encoder = TritonTokenEncoderDecoder()
+    encoder = TritonTokenEncoder()
     encoder.print_mapping()
     print(encoder.tokenize(data))
     print(encoder.encode())
@@ -699,7 +699,7 @@ def parallel_nsa_compression_bwd_kernel_dq(
 
     add_tl_torch_funcs(data)
     print(TritonLexer.tokens)
-    encoder = TritonTokenEncoderDecoder()
+    encoder = TritonTokenEncoder()
     print(encoder.tokenize(data))
     print(encoder.encode())
     print(encoder.decode(encoder.encode()))
@@ -799,7 +799,7 @@ Examples:
     
     if args.string:
         add_tl_torch_funcs(args.string)
-        encoder = TritonTokenEncoderDecoder()
+        encoder = TritonTokenEncoder()
         encoder.tokenize(args.string)
         encoded = encoder.encode()
         result = {
@@ -809,7 +809,7 @@ Examples:
     elif args.file:
         code = read_file(args.file)
         add_tl_torch_funcs(code)
-        encoder = TritonTokenEncoderDecoder()
+        encoder = TritonTokenEncoder()
         encoder.tokenize(code)
         encoded = encoder.encode()
         result = {
@@ -821,8 +821,8 @@ Examples:
         codes = process_json_file(args.json)
         results = []
         start_id = -1
-        if os.path.exists('endecoder.log') and os.path.getsize('endecoder.log') > 0:
-            with open('endecoder.log', 'r') as f:
+        if os.path.exists('encoder.log') and os.path.getsize('encoder.log') > 0:
+            with open('encoder.log', 'r') as f:
                 start_id = int(f.read())
         start_id += 1
         if os.path.exists('encoded_kernels.json'):
@@ -831,12 +831,12 @@ Examples:
                 results = original_results['kernels']
         for i, code in enumerate(tqdm.tqdm(codes[start_id:])):
             add_tl_torch_funcs(code)
-            encoder = TritonTokenEncoderDecoder()
+            encoder = TritonTokenEncoder()
             if os.path.exists('encoded_kernels.json'):
                 with open('encoded_kernels.json', 'r') as f:
                     original_results = json.load(f)
                     encoder.mapping.update(original_results['mapping'])
-            with open('endecoder.log', 'w') as f:
+            with open('encoder.log', 'w') as f:
                 f.write(f'{start_id + i}')
             encoder.tokenize(code)
             encoded = encoder.encode()
@@ -846,12 +846,12 @@ Examples:
                 'encoded': encoded
             })
         result = {'kernels': results, 'mapping': encoder.mapping}
-    
+    import pickle
+    with open('encoder.pkl', 'wb') as f:
+        pickle.dump(encoder, f)
     if args.output:
         with open(args.output, 'w') as f:
             json.dump(result, f)
-    
 
 if __name__ == '__main__':
-    # main()
-    test2()
+    main()

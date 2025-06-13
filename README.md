@@ -8,7 +8,7 @@
 4. Run `extract_kernels.py` to extract all kernel codes
 5. Run `count_tokens.py` to count the overall tokens in the `triton_kernels.json`
 6. (Optional) Run `header_body.py` to cut each kernel codes into kernel header and kernel body, both of which will be added into `triton_kernels.json`
-7. Run `endecoder.py` to encode the kernels.
+7. Run `encoder.py` to encode the kernels.
 
 ## Token Count Result
 

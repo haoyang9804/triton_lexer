@@ -8,7 +8,7 @@ from crawl import GitHubSearcher
 from rename_files import rename_files
 from remove_comments import process_directory
 from extract_kernels import TritonKernelExtractor
-from endecoder import TritonTokenEncoderDecoder, process_json_file, verify, add_tl_torch_funcs
+from encoder import TritonTokenEncoder, process_json_file, verify, add_tl_torch_funcs
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
