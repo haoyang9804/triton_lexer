@@ -44,7 +44,6 @@ tokens = (
     'DEF', 'IF', 'ELSE', 'ELIF', 'FOR', 'WHILE', 'WITH', 'TRY', 'EXCEPT', 'FINALLY',
     'ENDDEF', 'ENDIF', 'ENDELIF', 'ENDELSE', 'ENDFOR', 'ENDWHILE', 'ENDWITH', 'ENDTRY', 'ENDEXCEPT', 'ENDFINALLY',
     
-    
     # Other Python keywords
     'IN', 'RANGE', 'RETURN', 'NOT', 'AND', 'OR', 'IS', 'NONE',
     'TRUE', 'FALSE', 'BREAK', 'CONTINUE', 'PASS', 'YIELD',
@@ -55,7 +54,7 @@ tokens = (
     
     # Type related
     'STR', 'TYPE', 'ISINSTANCE', 'TUPLE', 'LIST',
-    'DICT', 'SET',
+    'DICT', 'SET', 'INT_TYPE', 'FLOAT_TYPE', 'BOOL_TYPE',
     
     # Triton specific
     'DL', 'LIBDEVICE', 'LIBSHMEM_DEVICE',
@@ -220,6 +219,7 @@ class TritonLexer:
         'continue': 'CONTINUE',
         'pass': 'PASS',
         'yield': 'YIELD',
+        'int'
         
         # End
         'enddef': 'ENDDEF',
@@ -255,6 +255,9 @@ class TritonLexer:
         'list': 'LIST',
         'dict': 'DICT',
         'set': 'SET',
+        'int': 'INT_TYPE',
+        'float': 'FLOAT_TYPE',
+        'bool': 'BOOL_TYPE',
         
         # Torch specific
         'torch': 'TORCH',
@@ -846,9 +849,21 @@ Examples:
                 'encoded': encoded
             })
         result = {'kernels': results, 'mapping': encoder.mapping}
+    
+    # 在序列化之前，移除包含 re.Match 对象的 lexer
+    encoder_for_pickle = type(encoder)()  # 创建一个新的编码器实例
+    encoder_for_pickle.mapping = encoder.mapping.copy()
+    encoder_for_pickle.next_value = encoder.next_value
+    encoder_for_pickle.oldName2NewName = encoder.oldName2NewName.copy()
+    encoder_for_pickle.varid = encoder.varid
+    encoder_for_pickle.fid = encoder.fid
+    encoder_for_pickle.tokens = encoder.tokens.copy()
+    # 不复制 lexer，这样就不会有 re.Match 对象
+    encoder_for_pickle.lexer = None
+    
     import pickle
     with open('encoder.pkl', 'wb') as f:
-        pickle.dump(encoder, f)
+        pickle.dump(encoder_for_pickle, f)
     if args.output:
         with open(args.output, 'w') as f:
             json.dump(result, f)

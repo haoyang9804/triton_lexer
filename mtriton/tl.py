@@ -1,12 +1,100 @@
 import numpy as np
-from typing import TypeVar, Callable, Any, Union, List, Tuple, Optional, Sequence
+from typing import TypeVar, Callable, Any, Union, List, Tuple, Optional, Sequence, Dict
 import functools
 import random
 import math
 import threading
+import warnings
 
 T = TypeVar('T')
 ArrayLike = Union[np.ndarray, List, Tuple]
+
+def get_dtype_itemsize(dtype) -> int:
+    """获取数据类型的 itemsize"""
+    try:
+        # 如果是 numpy 类型类（如 np.float32）
+        if isinstance(dtype, type) and issubclass(dtype, np.generic):
+            return dtype().itemsize
+        # 如果已经是 dtype 实例
+        elif hasattr(dtype, 'itemsize'):
+            return int(dtype.itemsize)
+        # 其他情况，转换为 dtype
+        else:
+            return np.dtype(dtype).itemsize
+    except Exception:
+        # 默认情况，使用 float32 的 itemsize
+        return 4
+
+class MemorySpace:
+    """模拟 Triton 的内存空间"""
+    def __init__(self):
+        self.global_memory: Dict[int, np.ndarray] = {}
+        self.shared_memory: Dict[int, np.ndarray] = {}
+        self.next_addr = 0x1000  # 起始地址
+        
+    def allocate(self, size: int, dtype: np.dtype = np.float32, memory_type: str = "global") -> int:
+        """分配内存并返回地址"""
+        addr = self.next_addr
+        itemsize = get_dtype_itemsize(dtype)
+        self.next_addr += size * itemsize
+        
+        if memory_type == "global":
+            self.global_memory[addr] = np.zeros(size, dtype=dtype)
+        elif memory_type == "shared":
+            self.shared_memory[addr] = np.zeros(size, dtype=dtype)
+        
+        return addr
+    
+    def get_memory(self, addr: int, memory_type: str = "global") -> Optional[np.ndarray]:
+        """根据地址获取内存"""
+        if memory_type == "global":
+            return self.global_memory.get(addr)
+        elif memory_type == "shared":
+            return self.shared_memory.get(addr)
+        return None
+
+class TensorPointer:
+    """模拟 Triton 的张量指针"""
+    def __init__(self, base_addr: int, shape: Tuple[int, ...], dtype: np.dtype, 
+                 strides: Optional[Tuple[int, ...]] = None, offset: int = 0, 
+                 memory_space: Optional[MemorySpace] = None, memory_type: str = "global"):
+        self.base_addr = base_addr
+        self.shape = shape
+        self.dtype = dtype
+        self.offset = offset
+        self.memory_space = memory_space or _global_memory_space
+        self.memory_type = memory_type
+        
+        if strides is None:
+            # 计算 C 风格的步长
+            self.strides = tuple(int(np.prod(shape[i+1:])) for i in range(len(shape)))
+        else:
+            self.strides = strides
+    
+    def get_effective_address(self, indices: Optional[Tuple[int, ...]] = None) -> int:
+        """计算有效地址"""
+        addr = self.base_addr + self.offset
+        if indices:
+            itemsize = get_dtype_itemsize(self.dtype)
+            for i, (idx, stride) in enumerate(zip(indices, self.strides)):
+                addr += idx * stride * itemsize
+        return addr
+    
+    def advance_offset(self, offsets: Sequence[int]):
+        """推进指针偏移"""
+        total_offset = 0
+        for offset, stride in zip(offsets, self.strides):
+            total_offset += offset * stride
+        itemsize = get_dtype_itemsize(self.dtype)
+        self.offset += total_offset * itemsize
+        return self
+    
+    def get_data(self) -> Optional[np.ndarray]:
+        """获取指针指向的数据"""
+        return self.memory_space.get_memory(self.base_addr, self.memory_type)
+
+# 全局内存空间实例
+_global_memory_space = MemorySpace()
 
 class tl:
     # Basic types
@@ -43,47 +131,216 @@ class tl:
         """Returns the number of program instances launched on the given axis"""
         return 1  # Simplified implementation
 
-    # Memory/pointer operations
+    # 内存/指针操作
     @staticmethod
-    def load(ptr: ArrayLike, mask: Optional[ArrayLike] = None, other: Optional[Any] = None,
-             cache: Optional[str] = None, evict: Optional[str] = None, volatile: bool = False) -> np.ndarray:
-        """Load data tensor from memory location defined by pointer"""
-        if isinstance(ptr, np.ndarray):
+    def load(ptr: Union[ArrayLike, TensorPointer], mask: Optional[ArrayLike] = None, 
+             other: Optional[Any] = None, cache: Optional[str] = None, 
+             evict: Optional[str] = None, volatile: bool = False) -> np.ndarray:
+        """从指针定义的内存位置加载数据张量"""
+        # 处理缓存提示
+        if cache and cache not in [".cg", ".ca", ".cs", ".cv"]:
+            warnings.warn(f"Unknown cache mode: {cache}, ignoring")
+        
+        if evict and evict not in [".lu", ".wb"]:
+            warnings.warn(f"Unknown evict mode: {evict}, ignoring")
+        
+        # 处理 TensorPointer
+        if isinstance(ptr, TensorPointer):
+            base_data = ptr.get_data()
+            if base_data is None:
+                raise RuntimeError(f"Invalid memory access at address {ptr.base_addr}")
+            
+            # 使用步长和偏移计算正确的内存访问
+            itemsize = get_dtype_itemsize(ptr.dtype)
+            base_offset = ptr.offset // itemsize
+            
+            # 创建结果数组
+            result = np.zeros(ptr.shape, dtype=ptr.dtype)
+            
+            # 根据步长从内存中获取数据
+            for indices in np.ndindex(ptr.shape):
+                # 计算线性索引
+                linear_idx = base_offset
+                for i, (idx, stride) in enumerate(zip(indices, ptr.strides)):
+                    linear_idx += idx * stride
+                
+                # 检查边界
+                if linear_idx >= base_data.size:
+                    raise RuntimeError(f"Memory access out of bounds: trying to access index {linear_idx}, but array size is {base_data.size}")
+                
+                # 从内存获取值
+                result[indices] = base_data.flat[linear_idx]
+        
+        # 处理常规数组
+        elif isinstance(ptr, np.ndarray):
             result = ptr.copy()
-            if mask is not None:
-                mask = np.asarray(mask, dtype=bool)
-                if other is not None:
-                    result = np.where(mask, result, other)
+        else:
+            result = np.asarray(ptr)
+        
+        # 应用掩码
+        if mask is not None:
+            mask = np.asarray(mask, dtype=bool)
+            # 确保掩码形状兼容
+            if mask.shape != result.shape:
+                if mask.size == result.size:
+                    mask = mask.reshape(result.shape)
                 else:
-                    result = np.where(mask, result, 0)
-            return result
-        return np.asarray(ptr)
+                    mask = np.broadcast_to(mask, result.shape)
+            
+            if other is not None:
+                other_array = np.asarray(other)
+                if other_array.shape != result.shape:
+                    other_array = np.broadcast_to(other_array, result.shape)
+                result = np.where(mask, result, other_array)
+            else:
+                # 对于被掩码的元素，使用零值
+                result = np.where(mask, result, np.zeros_like(result))
+        
+        # 模拟缓存行为（在实际实现中会影响性能）
+        if cache == ".cg":  # Cache at global level
+            pass  # 在模拟中无实际效果
+        elif cache == ".ca":  # Cache at all levels
+            pass
+        elif cache == ".cs":  # Cache streaming
+            pass
+        elif cache == ".cv":  # Cache volatile
+            pass
+        
+        return result
 
     @staticmethod
-    def store(ptr: ArrayLike, value: Any, mask: Optional[ArrayLike] = None,
-              cache: Optional[str] = None, evict: Optional[str] = None) -> None:
-        """Store data tensor to memory location defined by pointer"""
-        if isinstance(ptr, np.ndarray):
+    def store(ptr: Union[ArrayLike, TensorPointer], value: Any, 
+              mask: Optional[ArrayLike] = None, cache: Optional[str] = None, 
+              evict: Optional[str] = None) -> None:
+        """将数据张量存储到指针定义的内存位置"""
+        # 处理缓存提示
+        if cache and cache not in [".cg", ".ca", ".cs", ".cv", ".wb"]:
+            warnings.warn(f"Unknown cache mode: {cache}, ignoring")
+        
+        if evict and evict not in [".lu", ".wb"]:
+            warnings.warn(f"Unknown evict mode: {evict}, ignoring")
+        
+        value_array = np.asarray(value)
+        
+        # 处理 TensorPointer
+        if isinstance(ptr, TensorPointer):
+            base_data = ptr.get_data()
+            if base_data is None:
+                raise RuntimeError(f"Invalid memory access at address {ptr.base_addr}")
+            
+            # 使用步长和偏移计算正确的内存访问
+            itemsize = get_dtype_itemsize(ptr.dtype)
+            base_offset = ptr.offset // itemsize
+            
+            # 确保值的形状匹配
+            if value_array.shape != ptr.shape:
+                if value_array.size == 1:
+                    value_array = np.full(ptr.shape, value_array.item(), dtype=ptr.dtype)
+                else:
+                    value_array = np.broadcast_to(value_array, ptr.shape)
+            
+            # 根据步长向内存存储数据
+            for indices in np.ndindex(ptr.shape):
+                # 计算线性索引
+                linear_idx = base_offset
+                for i, (idx, stride) in enumerate(zip(indices, ptr.strides)):
+                    linear_idx += idx * stride
+                
+                # 检查边界
+                if linear_idx >= base_data.size:
+                    raise RuntimeError(f"Memory access out of bounds: trying to store at index {linear_idx}, but array size is {base_data.size}")
+                
+                # 应用掩码
+                if mask is not None:
+                    mask = np.asarray(mask, dtype=bool)
+                    if mask.shape != ptr.shape:
+                        if mask.size == int(np.prod(ptr.shape)):
+                            mask = mask.reshape(ptr.shape)
+                        else:
+                            mask = np.broadcast_to(mask, ptr.shape)
+                    
+                    # 只在掩码为 True 时存储
+                    if mask[indices]:
+                        base_data.flat[linear_idx] = value_array[indices]
+                else:
+                    # 直接存储值
+                    base_data.flat[linear_idx] = value_array[indices]
+        
+        # 处理常规数组
+        elif isinstance(ptr, np.ndarray):
             if mask is not None:
                 mask = np.asarray(mask, dtype=bool)
-                ptr[mask] = value
+                if mask.shape != ptr.shape:
+                    if mask.size == ptr.size:
+                        mask = mask.reshape(ptr.shape)
+                    else:
+                        mask = np.broadcast_to(mask, ptr.shape)
+                
+                if value_array.shape != ptr.shape:
+                    if value_array.size == 1:
+                        value_array = np.full(ptr.shape, value_array.item())
+                    else:
+                        value_array = np.broadcast_to(value_array, ptr.shape)
+                
+                ptr[mask] = value_array[mask]
             else:
-                ptr[:] = value
+                if value_array.shape != ptr.shape:
+                    if value_array.size == 1:
+                        ptr.fill(value_array.item())
+                    else:
+                        ptr[:] = np.broadcast_to(value_array, ptr.shape)
+                else:
+                    ptr[:] = value_array
+        else:
+            raise TypeError("ptr must be a numpy array or TensorPointer")
 
     @staticmethod 
-    def make_block_ptr(base: np.ndarray, shape: Tuple[int, ...], strides: Tuple[int, ...],
-                      offsets: Tuple[int, ...], block_shape: Tuple[int, ...], order: Tuple[int, ...]) -> np.ndarray:
-        """Returns a pointer to a block in the parent tensor"""
-        return base  # Simplified implementation
+    def make_block_ptr(base: Union[np.ndarray, int], shape: Tuple[int, ...], 
+                      strides: Tuple[int, ...], offsets: Tuple[int, ...], 
+                      block_shape: Tuple[int, ...], order: Tuple[int, ...]) -> TensorPointer:
+        """返回指向父张量中块的指针"""
+        if isinstance(base, np.ndarray):
+            # 为现有数组创建指针
+            addr = _global_memory_space.allocate(base.size, base.dtype)
+            base_data = _global_memory_space.get_memory(addr)
+            base_data[:] = base.flat
+        else:
+            addr = base  # 假设 base 是地址
+        
+        # 计算偏移
+        total_offset = 0
+        for offset, stride in zip(offsets, strides):
+            total_offset += offset * stride
+        
+        return TensorPointer(
+            base_addr=addr,
+            shape=block_shape,
+            dtype=base.dtype if isinstance(base, np.ndarray) else np.float32,
+            strides=strides,
+            offset=total_offset,
+            memory_space=_global_memory_space
+        )
 
     @staticmethod
-    def advance(ptr: ArrayLike, offsets: Sequence[int]) -> np.ndarray:
-        """Advances tensor pointer by offsets"""
-        return np.asarray(ptr)  # Simplified implementation
+    def advance(ptr: Union[ArrayLike, TensorPointer], offsets: Sequence[int]) -> Union[np.ndarray, TensorPointer]:
+        """推进张量指针的偏移量"""
+        if isinstance(ptr, TensorPointer):
+            new_ptr = TensorPointer(
+                base_addr=ptr.base_addr,
+                shape=ptr.shape,
+                dtype=ptr.dtype,
+                strides=ptr.strides,
+                offset=ptr.offset,
+                memory_space=ptr.memory_space,
+                memory_type=ptr.memory_type
+            )
+            return new_ptr.advance_offset(offsets)
+        else:
+            return np.asarray(ptr)  # 简化实现
 
     @staticmethod
     def make_tensor_descriptor(base: Any, shape: Tuple[int, ...], strides: Tuple[int, ...]) -> dict:
-        """Creates a tensor descriptor object"""
+        """创建张量描述符对象"""
         return {"base": base, "shape": shape, "strides": strides}
 
     # Creation operations
